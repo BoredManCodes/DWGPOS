@@ -38,6 +38,7 @@ Change Log:
     v2.0.5 -- 18/10/2023 - Added logging failures to text file
     v2.0.6 -- 30/10/2023 - If an invalid account is used, don't crash due to being unable to apply the payment
     v2.0.7 -- 30/10/2023 - Added What's New dialog
+    v2.0.8 -- 30/10/2023 - Added a system for taking payments for new accounts
 """
 
 import csv
@@ -78,13 +79,12 @@ dotenv.load_dotenv("U:/POS/.env")
 # Create the application
 basedir = os.path.dirname(__file__)
 #################################################################################
-VERSION_STRING = "2.0.7"
-VERSION_TUPLE = (2, 0, 7, 0)
+VERSION_STRING = "2.0.8"
+VERSION_TUPLE = (2, 0, 8, 0)
 APP_NAME = f"DWG POS v{VERSION_STRING}"
 WHAT_IS_NEW = """
-Added notification of failed payments to Trent 
-Added logging failures to text file
-If an invalid account is used, don't crash due to being unable to apply the payment
+Fixed a bug where the program would crash if an invalid account was used.
+Added a system for taking payments for new accounts, use 00000 as the account number.
 """
 #################################################################################
 
@@ -839,6 +839,9 @@ def apply_payment(account, authCode, amount):
         try:
             if DEBUG:
                 authCode = "TESTING"
+            if account == "00000":
+                message = f"Payment successful.\nReference: {authCode}"
+                return (message)
             date = datetime.datetime.now().strftime("%Y-%m-%d")
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             # Connect to the database
@@ -870,7 +873,6 @@ def apply_payment(account, authCode, amount):
                         "token": os.getenv("PUSHOVER_FAILURE"),
                         "user": os.getenv("PUSHOVER_USER"),
                         "message": f"Account {account} not found. Reference: {authCode} Amount: {amount}\n"
-                                   f"Cursor: {cur.fetchall()}\nRow: {row}\n",
                     },
                 )
                 return (message)
@@ -941,7 +943,6 @@ def apply_payment(account, authCode, amount):
                     "token": os.getenv("PUSHOVER_FAILURE"),
                     "user": os.getenv("PUSHOVER_USER"),
                     "message": f"Account {account} not found. Reference: {authCode} Amount: {amount}\n"
-                               f"Cursor: {cur.fetchall()}\nRow: {row}\n",
                 },
             )
             return (message)
@@ -962,7 +963,6 @@ def apply_payment(account, authCode, amount):
                 "token": os.getenv("PUSHOVER_FAILURE"),
                 "user": os.getenv("PUSHOVER_USER"),
                 "message": f"Account {account} not found. Reference: {authCode} Amount: {amount}\n"
-                           f"Cursor: {cur.fetchall()}\nRow: {row}\n",
             },
         )
         return (message)
@@ -1546,6 +1546,12 @@ def check_account(account):
     # if it is then set the input to green, if not then set it to red
     # Lookup the account via the database and append the name to the customer input
     try:
+        if account == "00000":
+            customerInput.setText("00000 - ")
+        if account.startswith("00000 - "):
+            customerInput.setStyleSheet("border: 2px solid green;")
+            customerInput.setToolTip("Account doesn't exist")
+            return
         if account.isnumeric():
             if len(account) == 5:
                 conn = psycopg2.connect(
@@ -1734,11 +1740,11 @@ if __name__ == "__main__":
         customerSearchButton = QPushButton(w)
         customerSearchButton.setText("Search")
         customerSearchButton.clicked.connect(customer_search_dialog)
-        customerSearchButton.move(70, 5)
+        customerSearchButton.move(80, 5)
         customerSearchButton.show()
 
         customerInput = QLineEdit(w)
-        customerInput.setPlaceholderText("Enter the account number")
+        customerInput.setPlaceholderText("Use 00000 for new account")
         customerInput.cursorPositionChanged.connect(
             lambda: check_account(customerInput.text())
         )
