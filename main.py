@@ -39,6 +39,15 @@ Change Log:
     v2.0.6 -- 30/10/2023 - If an invalid account is used, don't crash due to being unable to apply the payment
     v2.0.7 -- 30/10/2023 - Added What's New dialog
     v2.0.8 -- 30/10/2023 - Added a system for taking payments for new accounts
+    v2.0.9 -- 30/10/2023 - Added option to not apply payments to accounts
+    v2.1.0 -- 14/11/2023 - Added check for valid expiry date
+    v2.1.1 -- 19/11/2023 - Fixed crash
+    v2.1.2 -- 20/11/2023 - Fixed crash when failing to lookup account email address
+    v2.1.3 -- 23/11/2023 - Changed wording of DO_NOT_HONOR error, made payments always have a $ sign
+    v2.1.4 -- 28/11/2023 - Added card type indicator
+    v2.1.5 -- 28/11/2023 - Fixed leading whitespace in business account names
+    v2.1.6 -- 28/11/2023 - Added week number display to system tray icon
+    v2.1.7 -- 02/01/2024 - Allowed for entry of abnormal card number lengths
 """
 
 import csv
@@ -49,8 +58,6 @@ import simplify
 import sys
 import time
 import decimal
-import win32evtlog
-import win32evtlogutil
 import win32com.client as win32
 from PyQt5.QtCore import QTimer, Qt, QSize
 from PyQt5.QtGui import QIcon, QPixmap, QMovie
@@ -63,7 +70,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QListWidget,
     QDialog,
-    QStatusBar,
+    QStatusBar, QCheckBox, QSystemTrayIcon,
 )
 import psycopg2
 import ctypes
@@ -79,12 +86,11 @@ dotenv.load_dotenv("U:/POS/.env")
 # Create the application
 basedir = os.path.dirname(__file__)
 #################################################################################
-VERSION_STRING = "2.0.8"
-VERSION_TUPLE = (2, 0, 8, 0)
+VERSION_STRING = "2.1.7"
+VERSION_TUPLE = (2, 1, 7, 0)
 APP_NAME = f"DWG POS v{VERSION_STRING}"
 WHAT_IS_NEW = """
-Fixed a bug where the program would crash if an invalid account was used.
-Added a system for taking payments for new accounts, use 00000 as the account number.
+Made changes to allow for entry of new 19 digit VISA cards and 17 digit Mastercards
 """
 #################################################################################
 
@@ -168,14 +174,7 @@ EVT_CATEG = 9876
 EVT_STRS = [
     f"Started DWG POS at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}"
 ]
-# Log start of program
-win32evtlogutil.ReportEvent(
-    APP_NAME,
-    EVT_ID,
-    eventCategory=EVT_CATEG,
-    eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE,
-    strings=EVT_STRS,
-)
+
 if DEBUG:
     simplify.public_key = os.getenv("SANDBOX_PUBLIC_KEY")
     simplify.private_key = os.getenv("SANDBOX_PRIVATE_KEY")
@@ -751,8 +750,8 @@ response_codes = {
     "failing.\nNext Steps: The customer should use an alternate card or contact their bank.",
     "INVALID_CARD_NUMBER": "Error: The customer’s bank declined the transaction because the card number is "
     "invalid.\nNext Steps: The customer should check their card number and try again.",
-    "DO_NOT_HONOUR": "Error: The customer’s bank declined the transaction but did not provide any more "
-    "information.\nNext Steps: The customer should check the card details and try again.",
+    "DO_NOT_HONOUR": "Error: The bank rejected this transaction, for an unknown reason. Likely due to invalid expiry or CVV."
+    "\nNext Steps: The customer should check their card details or try an alternate payment method.",
     "RESTRICTED_CARD": "Error: The customer’s bank declined the transaction because the card cannot be used for this "
     "type of transaction.\nNext Steps: The customer should use an alternate card and contact their"
     " bank.",
@@ -972,6 +971,11 @@ def process_payment():
     mbox.setWindowTitle("Payment Status")
     mbox.setWindowIcon(QIcon("U:/POS/pos.ico"))
     try:
+        # If the amount doesn't start with a $, then add it
+        if not amountInput.text().startswith("$"):
+            amountInputString = "$" + amountInput.text()
+        else:
+            amountInputString = amountInput.text()
         amount = amountInput.text().strip("$")
         # Convert dollars to cents
         amount = decimal.Decimal(amount) * 100
@@ -981,13 +985,6 @@ def process_payment():
             EVT_STRS = [
                 f"Payment declined due to excessive amount. Amount was: ${amount / 100}"
             ]
-            win32evtlogutil.ReportEvent(
-                APP_NAME,
-                EVT_ID,
-                eventCategory=EVT_CATEG,
-                eventType=win32evtlog.EVENTLOG_WARNING_TYPE,
-                strings=EVT_STRS,
-            )
             message = EVT_STRS[0]
             r = requests.post(
                 "https://api.pushover.net/1/messages.json",
@@ -1012,7 +1009,7 @@ def process_payment():
                     writer.writerow(
                         [
                             customerInput.text(),
-                            amountInput.text(),
+                            amountInputString,
                             "DECLINED",
                             int(time.time()),
                         ]
@@ -1036,13 +1033,7 @@ def process_payment():
         )
         # Log process of payment
         EVT_STRS = [f"Processed payment:\n{payment}"]
-        win32evtlogutil.ReportEvent(
-            APP_NAME,
-            EVT_ID,
-            eventCategory=EVT_CATEG,
-            eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE,
-            strings=EVT_STRS,
-        )
+
         # Check payment status
         if payment.paymentStatus == "APPROVED":
             # save this transaction to the CSV
@@ -1052,7 +1043,7 @@ def process_payment():
                     writer.writerow(
                         [
                             "None",
-                            amountInput.text(),
+                            amountInputString,
                             "APPROVED",
                             int(time.time()),
                             payment.authCode,
@@ -1062,28 +1053,25 @@ def process_payment():
                     writer.writerow(
                         [
                             customerInput.text(),
-                            amountInput.text(),
+                            amountInputString,
                             "APPROVED",
                             int(time.time()),
                             payment.authCode,
                         ]
                     )
-            applied_payment = apply_payment(
-                    customerInput.text().split(" ")[0], payment.authCode, amount / 100
-                )
+            if applyPaymentCheckbox.isChecked():
+                applied_payment = apply_payment(
+                        customerInput.text().split(" ")[0], payment.authCode, amount / 100
+                    )
+            else:
+                applied_payment = f"Payment successful.\nReference: {payment.authCode}"
             if "applied to account" not in applied_payment:
                 pyperclip.copy(payment.authCode)
             # applied_payment = f"Payment successful.\nReference: {payment.authCode}"
             mbox.setText(applied_payment)
             # Log if payment was applied
             EVT_STRS = [f"Applied payment:\n{applied_payment}"]
-            win32evtlogutil.ReportEvent(
-                APP_NAME,
-                EVT_ID,
-                eventCategory=EVT_CATEG,
-                eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE,
-                strings=EVT_STRS,
-            )
+
             # reset the input fields
             cardNumberInput.setText("")
             cardExpiryInput.setText("")
@@ -1095,6 +1083,8 @@ def process_payment():
             customerInput.setStyleSheet("")
             # set the cursor back to the amount input
             customerInput.setFocus()
+            applyPaymentCheckbox.setChecked(True)
+
 
         elif payment.paymentStatus == "DECLINED":
             if payment.declineReason in response_codes:
@@ -1106,7 +1096,7 @@ def process_payment():
                         writer.writerow(
                             [
                                 "None",
-                                amountInput.text(),
+                                amountInputString,
                                 f"DECLINED - {response_codes[payment.declineReason]}",
                                 int(time.time()),
                             ]
@@ -1115,7 +1105,7 @@ def process_payment():
                         writer.writerow(
                             [
                                 customerInput.text(),
-                                amountInput.text(),
+                                amountInputString,
                                 f"DECLINED - {response_codes[payment.declineReason]}",
                                 int(time.time()),
                             ]
@@ -1138,13 +1128,13 @@ def process_payment():
                     writer = csv.writer(f)
                     if customerInput.text() == "":
                         writer.writerow(
-                            ["None", amountInput.text(), "unknown", int(time.time())]
+                            ["None", amountInputString, "unknown", int(time.time())]
                         )
                     else:
                         writer.writerow(
                             [
                                 customerInput.text(),
-                                amountInput.text(),
+                                amountInputString,
                                 "unknown",
                                 int(time.time()),
                             ]
@@ -1158,13 +1148,13 @@ def process_payment():
                 writer = csv.writer(f)
                 if customerInput.text() == "":
                     writer.writerow(
-                        ["None", amountInput.text(), "unknown", int(time.time())]
+                        ["None", amountInputString, "unknown", int(time.time())]
                     )
                 else:
                     writer.writerow(
                         [
                             customerInput.text(),
-                            amountInput.text(),
+                            amountInputString,
                             "unknown",
                             int(time.time()),
                         ]
@@ -1178,7 +1168,7 @@ def process_payment():
                 writer.writerow(
                     [
                         "None",
-                        amountInput.text(),
+                        amountInputString,
                         f"DECLINED - {response_codes['INVALID_CARD_NUMBER']}",
                         int(time.time()),
                     ]
@@ -1187,20 +1177,14 @@ def process_payment():
                 writer.writerow(
                     [
                         customerInput.text(),
-                        amountInput.text(),
+                        amountInputString,
                         f"DECLINED - {response_codes['INVALID_CARD_NUMBER']}",
                         int(time.time()),
                     ]
                 )
         # Log error
         EVT_STRS = [f"Payment Failed: {e.message}"]
-        win32evtlogutil.ReportEvent(
-            APP_NAME,
-            EVT_ID,
-            eventCategory=EVT_CATEG,
-            eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
-            strings=EVT_STRS,
-        )
+
         message = EVT_STRS[0]
         r = requests.post(
             "https://api.pushover.net/1/messages.json",
@@ -1227,6 +1211,7 @@ def process_payment():
         cardNumberInput.setStyleSheet("")
         customerInput.setStyleSheet("")
         customerInput.setFocus()
+        applyPaymentCheckbox.setChecked(True)
     except psycopg2.errors.ProgrammingError as e:
         mbox.setText("The account number is invalid, please check the payment was successful in the recent transactions list.")
         # Append the traceback to U:/POS/failed_payments.txt -- date - username - error
@@ -1243,6 +1228,8 @@ def process_payment():
         cardNumberInput.setStyleSheet("")
         customerInput.setStyleSheet("")
         customerInput.setFocus()
+        applyPaymentCheckbox.setChecked(True)
+
 
     except BaseException as e:
         mbox.setText(
@@ -1250,13 +1237,7 @@ def process_payment():
         )
         # Log error
         EVT_STRS = [f"Payment Failed: {e}"]
-        win32evtlogutil.ReportEvent(
-            APP_NAME,
-            EVT_ID,
-            eventCategory=EVT_CATEG,
-            eventType=win32evtlog.EVENTLOG_ERROR_TYPE,
-            strings=EVT_STRS,
-        )
+
         message = EVT_STRS[0]
         r = requests.post(
             "https://api.pushover.net/1/messages.json",
@@ -1323,7 +1304,10 @@ def get_email(name, amount, date, authCode):
         cur = conn.cursor()
         cur.execute(f"SELECT * FROM account WHERE acct = {account}")
         row = cur.fetchone()
-        email = row[19]
+        try:
+            email = row[19]
+        except TypeError:
+            email = ""
         emailInput.setText(email)
     except IndexError:
         pass
@@ -1358,13 +1342,7 @@ def email_receipt(name, amount, date, authCode, email):
         EVT_STRS = [
             f"Receipt sent to {email}, for {amount}, on {time.strftime('%d-%m-%Y %H:%M:%S', time.localtime(int(date)))}, with auth code {authCode}, for {name}"
         ]
-        win32evtlogutil.ReportEvent(
-            APP_NAME,
-            EVT_ID,
-            eventCategory=EVT_CATEG,
-            eventType=win32evtlog.EVENTLOG_INFORMATION_TYPE,
-            strings=EVT_STRS,
-        )
+
         # show a dialog saying the email was sent then close after 1.5 seconds
         mbox = QMessageBox()
         mbox.setWindowTitle("Email Receipt")
@@ -1506,28 +1484,57 @@ def check_card(card_number):
     # Luhn's Algorithm, used to check if the card number is valid
     # https://en.wikipedia.org/wiki/Luhn_algorithm
     try:
-        # Reverse the card number
+        # Recognize a card type based on the first digits
+        if str(card_number).startswith("3"):
+            # Code to set Amex card image
+            pass
+        elif str(card_number).startswith("4"):
+            # Code to set Visa card image
+            pass
+        elif str(card_number).startswith("5"):
+            # Code to set Mastercard image
+            pass
+        elif str(card_number).startswith("62") or str(card_number).startswith("60"):
+            # Code to set UnionPay image
+            pass
+        elif str(card_number).startswith("6"):
+            # Code to set Discover image
+            pass
+        else:
+            # Hide card type image if not recognized
+            cardTypeImage.hide()
+
+        # Remove spaces from the card number
         card_number = card_number.replace(" ", "")
-        length = len(str(card_number))
-        card_number = card_number[::-1]
-        # Convert to a list of integers
-        card_number = [int(i) for i in card_number]
-        # Double every second digit
-        card_number = [
-            i * 2 if index % 2 == 1 else i for index, i in enumerate(card_number)
-        ]
-        # Subtract 9 from numbers over 9
-        card_number = [i - 9 if i > 9 else i for i in card_number]
-        # Sum all digits
-        card_number = sum(card_number)
-        # If the sum is divisible by 10, it is valid
-        if card_number % 10 == 0 and length == 16:
-            cardNumberInput.setStyleSheet("border: 2px solid green;")
-            cardNumberInput.setToolTip("Card is valid")
-            processButton.setEnabled(True)
+
+        # Get the length of the card number
+        length = len(card_number)
+
+        # Check if the card number length is within the valid range
+        if 8 <= length <= 19:
+            # Reverse the card number
+            card_number = card_number[::-1]
+            # Convert to a list of integers
+            card_number = [int(i) for i in card_number]
+            # Double every second digit
+            card_number = [i * 2 if index % 2 == 1 else i for index, i in enumerate(card_number)]
+            # Subtract 9 from numbers over 9
+            card_number = [i - 9 if i > 9 else i for i in card_number]
+            # Sum all digits
+            card_number = sum(card_number)
+
+            # If the sum is divisible by 10, it is valid
+            if card_number % 10 == 0:
+                cardNumberInput.setStyleSheet("border: 2px solid green;")
+                cardNumberInput.setToolTip("Card is valid")
+                processButton.setEnabled(True)
+            else:
+                cardNumberInput.setStyleSheet("border: 2px solid red;")
+                cardNumberInput.setToolTip("Card is invalid")
+                processButton.setEnabled(False)
         else:
             cardNumberInput.setStyleSheet("border: 2px solid red;")
-            cardNumberInput.setToolTip("Card is invalid")
+            cardNumberInput.setToolTip("Invalid card length")
             processButton.setEnabled(False)
     except BaseException as e:
         # Append the traceback to U:/POS/failed_payments.txt -- date - username - error
@@ -1573,7 +1580,7 @@ def check_account(account):
                     if balance <= 0:
                         balance = ""
                     # If the account belongs to a business, the first name will be "None"
-                    if first_name == None:
+                    if first_name is None or len(first_name) == 0:
                         customerInput.setText(f"{account} - {last_name}")
                     else:
                         customerInput.setText(f"{account} - {first_name} {last_name}")
@@ -1713,15 +1720,43 @@ def customer_search_select():
         pass
 
 
+def check_expiry(expiry):
+    try:
+        # Check if the expiry date is valid
+        # Convert the expiry date to a datetime object
+        expiry = datetime.datetime.strptime(expiry, "%m/%y")
+        # Check if the expiry date is in the future
+        if expiry > datetime.datetime.now():
+            cardExpiryInput.setStyleSheet("border: 2px solid green;")
+            cardExpiryInput.setToolTip("Expiry date is valid")
+        else:
+            cardExpiryInput.setStyleSheet("border: 2px solid red;")
+            cardExpiryInput.setToolTip("Expiry date is invalid")
+    except ValueError:
+        cardExpiryInput.setStyleSheet("border: 2px solid red;")
+        cardExpiryInput.setToolTip("Expiry date is invalid")
+    except BaseException as e:
+        # Append the traceback to U:/POS/failed_payments.txt -- date - username - error
+        error = "Error on line {}".format(sys.exc_info()[-1].tb_lineno), type(e).__name__, e
+        with open("U:/POS/failed_payments.txt", "a") as f:
+            f.write(
+                f"{datetime.datetime.now()} - {get_display_name(3)} - {error}\n"
+            )
+        # print complete error with line number
+        print(error)
+        pass
+
 if __name__ == "__main__":
     global amountInput
     global customerInput
+    global cardTypeImage
     global cardNumberInput
     global cardExpiryInput
     global cardCVCInput
     global recentTransactionsList
     global recentTransactionsLoader
     global recentTransactionsLoaderLabel
+
     try:
         app = QApplication(sys.argv)
         app.setStyle("Fusion")
@@ -1775,8 +1810,14 @@ if __name__ == "__main__":
         cardNumberLabel.move(10, 110)
         cardNumberLabel.show()
 
+        cardTypeImage = QLabel(w)
+        cardTypeImage.move(90, 101)
+        cardTypeImage.setFixedWidth(50)
+        cardTypeImage.setFixedHeight(30)
+        cardTypeImage.show()
+
         cardNumberInput = QLineEdit(w)
-        cardNumberInput.setInputMask("9999 9999 9999 9999")
+        cardNumberInput.setInputMask("9999 9999 9999 9999 999")
         cardNumberInput.cursorPositionChanged.connect(
             lambda: check_card(cardNumberInput.text())
         )
@@ -1800,7 +1841,7 @@ if __name__ == "__main__":
         cardExpiryInput.setPlaceholderText("MM/YY")
         cardExpiryInput.setInputMask("99/99")
         cardExpiryInput.cursorPositionChanged.connect(
-            lambda: check_card(cardNumberInput.text())
+            lambda: check_expiry(cardExpiryInput.text())
         )
         cardExpiryInput.returnPressed.connect(
             lambda: [cardCVCInput.setFocus(), cardCVCInput.setCursorPosition(0)]
@@ -1835,6 +1876,7 @@ if __name__ == "__main__":
                 cardNumberInput.setStyleSheet(""),
                 customerInput.setStyleSheet(""),
                 customerInput.setFocus(),
+                applyPaymentCheckbox.setChecked(True),
             ]
         )
 
@@ -1846,6 +1888,12 @@ if __name__ == "__main__":
         processButton.setDefault(True)
         processButton.setEnabled(False)
         processButton.clicked.connect(lambda: [process_payment()])
+
+        applyPaymentCheckbox = QCheckBox(w)
+        applyPaymentCheckbox.setText("Apply payment to account?")
+        applyPaymentCheckbox.move(275, 262)
+        applyPaymentCheckbox.setChecked(True)
+        applyPaymentCheckbox.show()
 
         # Add a recent transactions list on the RHS
         recentTransactionsLabel = QLabel(w)
@@ -1884,6 +1932,14 @@ if __name__ == "__main__":
             statusBar.move(0, 282)
             statusBar.setFixedWidth(450)
             statusBar.show()
+
+        # Display the current week of the year number in the Windows system tray
+        # Get the current week number
+        week_number = datetime.date.today().isocalendar()[1]
+        tray = QSystemTrayIcon(QIcon(f"U:/POS/week_numbers/week_{week_number}.ico"), w)
+        tray.setToolTip("David Walsh Gas EFTPOS")
+        tray.show()
+
         w.show()
         customerInput.setFocus()
         sys.exit(app.exec_())
@@ -1900,3 +1956,4 @@ if __name__ == "__main__":
             # print complete error with line number
             print(error)
             pass
+
